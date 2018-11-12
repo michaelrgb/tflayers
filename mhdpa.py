@@ -28,33 +28,32 @@ class MHDPA(base.Layer):
 
     def apply(self, x):
         s = x.shape.as_list()
+        attention_dims = len(s) - 2 # Attention is 2D for images
         d_model = s[-1]
         d_v = self.d_k
+
+        layer_2nd = False
         if not self.weights:
             # Sublayer 1
             self.query = self.add_variable('query', [d_model, self.heads, self.d_k])
             self.key = self.add_variable('key',     [d_model, self.heads, self.d_k])
             self.value = self.add_variable('value', [d_model, self.heads, d_v])
-            self.final = self.add_variable('final', [self.heads, d_v, d_model])
-            # Sublayer 2
-            self.kernel1 = self.add_variable('kernel1', [d_model, self.d_ff])
-            self.kernel2 = self.add_variable('kernel2', [self.d_ff, d_model])
+            self.final = self.add_variable('final', [self.heads, d_v*2, d_model])
 
-        def layer_norm(n): return tf.contrib.layers.layer_norm(n, False, False, begin_norm_axis=-1)
+            if layer_2nd:
+                # Sublayer 2
+                self.kernel1 = self.add_variable('kernel1', [d_model, self.d_ff])
+                self.kernel2 = self.add_variable('kernel2', [self.d_ff, d_model])
+
+        double_relu = lambda x: tf.nn.relu(tf.concat([x, -x], -1))
 
         # Project each entity into q,k,v vectors
         query = tf.tensordot(x, self.query, [[-1], [0]])
-        key = tf.tensordot(x, self.key, [[-1], [0]])
+        key   = tf.tensordot(x, self.key,   [[-1], [0]])
         value = tf.tensordot(x, self.value, [[-1], [0]])
 
-        if 1:
-            query = layer_norm(query)
-            key = layer_norm(key)
-            #value = layer_norm(value)
-
         # Compare each q with every other entity k via dot-product
-        dims = 2
-        for d in range(dims):
+        for d in range(attention_dims):
             query = tf.expand_dims(query, 3)
             key = tf.expand_dims(key, 1)
             value = tf.expand_dims(value, 1)
@@ -62,23 +61,26 @@ class MHDPA(base.Layer):
 
         # Softmax on combined dimension
         unnormalized = tf.reshape(unnormalized, [s[0], s[1]*s[2], s[1],s[2], self.heads])
+        unnormalized *= 5
         attention = tf.nn.softmax(unnormalized/self.d_k**0.5, 1)
         attention = tf.reshape(attention, [s[0], s[1],s[2], s[1],s[2], self.heads])
 
         # Weighted sum of attention values
         A = tf.expand_dims(attention, -1) * value
-        A = tf.reduce_sum(tf.reduce_sum(A, 3), 3)
+        for d in range(attention_dims):
+            A = tf.reduce_sum(A, 3)
 
         # Concatenate and once again project, resulting in the final values
-        final = tf.tensordot(A, self.final, [[-2,-1], [0,1]])
+        A = double_relu(A)
+        ret = tf.tensordot(A, self.final, [[-2,-1], [0,1]])
 
-        # Residual & Norm 1
-        sublayer1 = layer_norm(final+x)
+        ret += x # Residual
+        if not layer_2nd:
+            return ret, attention
 
         # 2-layer MLP
-        mlp = tf.nn.relu(tf.tensordot(sublayer1, self.kernel1, [[-1], [0]]))
+        mlp = tf.nn.relu(tf.tensordot(ret, self.kernel1, [[-1], [0]]))
         mlp = tf.tensordot(mlp, self.kernel2, [[-1], [0]])
 
-        # Residual & Norm 2
-        sublayer2 = layer_norm(mlp+sublayer1)
-        return sublayer2, attention
+        ret += mlp # Residual
+        return ret, attention
