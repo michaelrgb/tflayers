@@ -1,33 +1,64 @@
 import tensorflow as tf
 
-def apply_layer(layer, n, *args):
-    _ = layer.apply(n, *args) # to create layer.weights
-
+def apply_layer(layer, n, extra_args=[], extra_objs=[]):
+    _ = layer.apply(n, *extra_args) # to create layer.weights
     # This assumes the variable name is passed to layer.add_variable()
-    keys = [w.name.split('/')[-1].split(':')[0] for w in layer.weights]
+    layer_objs = [layer] + [layer.__dict__[s] for s in extra_objs]
+    keys = {w.name.split('/')[-1].split(':')[0]: None for w in sum([l.weights for l in layer_objs], [])}
+
+    if extra_objs:
+        keys.pop('bias') # rnn_cell_impl.py
+        keys['biases'] = None
+        keys.pop('kernel')
+        keys['weights'] = None
+    for k in keys:
+        for obj in layer_objs:
+            if '_'+k in obj.__dict__: # LSTM _w_f_diag etc
+                keys.pop(k)
+                k = '_'+k
+                keys[k] = None
+            if k in obj.__dict__:
+                keys[k] = obj
+                break
 
     batch_size = int(n.shape[0])
-    unstacked = tf.unstack(n)
+    apply_args = [n] + extra_args
+    for i,arg in enumerate(apply_args):
+        try: # LSTMStateTuple
+            apply_args[i] = zip(*[[tf.expand_dims(un,0) for un in tf.unstack(a)] for a in arg])
+        except:
+            apply_args[i] = [tf.expand_dims(un,0) for un in tf.unstack(arg)]
     for j in range(batch_size):
         real_weights = {}
-        for key in keys:
+        for k,obj in keys.items():
             # Create a weight alias for this batch instance
-            w = layer.__dict__[key]
-            real_weights[key] = w
+            w = obj.__dict__[k]
+            real_weights[k] = w
             weight_map = apply_layer.weight_map.get(w, [])
             apply_layer.weight_map[w] = weight_map
             if j >= len(weight_map):
-                weight_map.append(tf.identity(w))
-            layer.__dict__[key] = weight_map[j]
+                w = tf.identity(w)
+                type(w).__nonzero__ = lambda self: True
+                weight_map.append(w)
+            obj.__dict__[k] = weight_map[j]
 
         # Do layer operation, wrapping the same weights in a different identity op for each batch instance
-        unstacked[j] = layer.apply(tf.expand_dims(unstacked[j], 0), *args)
+        args = [unstacked[j] for unstacked in apply_args]
+        unstacked[j] = layer.apply(*args)
 
         # Restore the layer's real weights
-        for key in keys:
-            layer.__dict__[key] = real_weights[key]
+        for k,obj in keys.items():
+            obj.__dict__[k] = real_weights[k]
 
-    return tf.concat(unstacked, 0)
+    def has_len(x):
+        try: _ = x[0].__len__ is not None
+        except: return False
+        return True
+    multi_ret = has_len(unstacked)
+    all_returns = zip(*unstacked) if multi_ret else [unstacked]
+    for i,ret in enumerate(all_returns):
+        all_returns[i] = [tf.concat(r, 0) for r in zip(*ret)] if has_len(ret) else tf.concat(ret, 0)
+    return all_returns if multi_ret else all_returns[0]
 apply_layer.weight_map = {}
 
 # Unaggregated gradients for each instance in batch
