@@ -24,10 +24,9 @@ def top_k_conv(x, top_k):
     top_k_idx = tf.nn.top_k(reshape_dims(sum_features, 2), top_k)[1] # 1D indices
     #x = concat_coord_xy(x)
     x = tf.reshape(x, [x.shape[0], x.shape[1]*x.shape[2], -1]) # 2D -> 1D
-    #x = index_tensor(x, top_k_idx)
 
     # gather_nd slices into first N dimensions, where N = indices.shape[-1]
-    x =  tf.gather_nd(x, tf.tile(tf.expand_dims(top_k_idx,-1), [1,1,2]))
+    x = tf.gather_nd(x, tf.tile(tf.expand_dims(top_k_idx,-1), [1,1,2]))
     return x, top_k_idx
 
 # https://arxiv.org/abs/1706.03762
