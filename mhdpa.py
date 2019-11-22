@@ -1,4 +1,4 @@
-import tensorflow as tf
+import tensorflow as tf, numpy as np
 from tensorflow.python.layers import base
 from tfutils import *
 
@@ -32,74 +32,86 @@ def top_k_conv(x, top_k):
 # https://arxiv.org/abs/1706.03762
 class MHDPA(base.Layer):
     # heads*d_k should be >= d_model
-    def __init__(self, heads=16, d_k=32, d_v=32, d_ff=0):
+    def __init__(self, heads=16, d_k=32, d_v=32, d_ff=128):
         super(MHDPA, self).__init__()
         self.heads = heads
         self.d_k = d_k
         self.d_v = d_v
         self.d_ff = d_ff
+        self.final = self.kernel1 = None
 
-    def apply(self, x_from, x_to, final_value=True, residual=False):
+    def apply(self, x_from, x_to, final_value=True, residual=True, expand_from=1, softmax_dim=0):
         s = x_to.shape.as_list()
-        to_dims = len(s) - 2 # Attention is 2D for images
-        from_dims = len(x_from.shape.as_list()) - 2
         d_model = s[-1]
+        expand_to = len(x_from.shape.as_list()) + expand_from - len(s)
 
         if not self.weights:
             # Sublayer 1
             self.query = self.add_variable('query', [d_model, self.heads, self.d_k])
             self.key = self.add_variable('key',     [d_model, self.heads, self.d_k])
             self.value = self.add_variable('value', [d_model, self.heads, self.d_v])
-            if final_value:
-                self.final = self.add_variable('final', [self.heads, self.d_v, d_model])
-
-            if self.d_ff:
-                # Sublayer 2
-                self.kernel1 = self.add_variable('kernel1', [d_model, self.d_ff])
-                self.kernel2 = self.add_variable('kernel2', [self.d_ff, d_model])
 
         # Project each entity into q,k,v vectors
         query = tf.tensordot(x_from, self.query, [-1, 0])
         key   = tf.tensordot(x_to, self.key,     [-1, 0])
         value = tf.tensordot(x_to, self.value,   [-1, 0])
 
+        if 1:
+            def layer_norm(n): return tf.contrib.layers.layer_norm(n, False, False, begin_norm_axis=-1)
+            query = layer_norm(query)
+            key = layer_norm(key)
+            #value = layer_norm(value)
+
         # Compare each q with every other entity k via dot-product
-        to_start = 1+from_dims
-        for d in range(to_dims):
-            query = tf.expand_dims(query, to_start)
-        for d in range(from_dims):
+        for d in range(expand_from):
+            query = tf.expand_dims(query, softmax_dim)
+        for d in range(expand_to):
             key = tf.expand_dims(key, 1)
             value = tf.expand_dims(value, 1)
 
         dot_product = tf.reduce_sum(query * key, -1)
-        #dot_product /= self.d_k**0.5
+        dot_product /= self.d_k**0.5
 
-        # Softmax on flattened to_dims
-        if to_dims==2:
+        # Softmax on flattened expand_from
+        if expand_from==2:
             dot_product = tf.reshape(dot_product, [s[0], s[1]*s[2], s[1],s[2], self.heads])
-        attention = tf.nn.softmax(dot_product, to_start)
+        attention = tf.nn.softmax(dot_product, softmax_dim)
         #attention = tf.nn.sigmoid(dot_product)
-        if to_dims==2:
+        if expand_from==2:
             attention = tf.reshape(attention, [s[0], s[1],s[2], s[1],s[2], self.heads])
 
         # Weighted sum of attention values
         A = tf.expand_dims(attention, -1) * value
-        for d in range(to_dims):
-            A = tf.reduce_sum(A, to_start)
+        for d in range(expand_from):
+            A = tf.reduce_sum(A, softmax_dim)
 
         if not final_value:
             return A, attention
 
-        # Concatenate and once again project, resulting in the final values
-        ret = tf.tensordot(A, self.final, [[-2,-1], [0,1]])
+        if self.d_ff:
+            # Is the final weight matrix needed before the MLP ?
+            ret = tf.reshape(A, [-1, np.prod(A.shape[1:])])
+        else:
+            if not self.final:
+                self.final = self.add_variable('final', [self.heads, self.d_v, d_model])
 
-        if residual: ret += x_from
-        if not self.d_ff:
-            return ret, attention # No FF layer 2
+            # Concatenate and once again project, resulting in the final values
+            ret = tf.tensordot(A, self.final, [[-2,-1], [0,1]])
+
+            if residual: ret += x_from
+            if not self.d_ff:
+                return ret, attention # No FF layer 2
+
+        if not self.kernel1:
+            # Sublayer 2
+            self.kernel1 = self.add_variable('kernel1', [ret.shape[-1], self.d_ff])
+            self.kernel2 = self.add_variable('kernel2', [self.d_ff*2, d_model])
 
         # 2-layer MLP
-        mlp = tf.nn.relu(tf.tensordot(ret, self.kernel1, [[-1], [0]]))
-        mlp = tf.tensordot(mlp, self.kernel2, [[-1], [0]])
+        mlp = double_relu(tf.tensordot(ret, self.kernel1, [[-1], [0]]))
+        ret = tf.tensordot(mlp, self.kernel2, [[-1], [0]])
 
-        if residual: ret += mlp
+        if residual:
+            #ret += mlp
+            ret += x_from
         return ret, attention
