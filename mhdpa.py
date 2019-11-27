@@ -29,39 +29,41 @@ def top_k_conv(x, top_k):
     x = tf.gather_nd(x, tf.tile(tf.expand_dims(top_k_idx,-1), [1,1,2]))
     return x, top_k_idx
 
+def layer_norm(n):
+    return tf.contrib.layers.layer_norm(n, False, False, begin_norm_axis=-1)
+
 # https://arxiv.org/abs/1706.03762
 class MHDPA(base.Layer):
     # heads*d_k should be >= d_model
-    def __init__(self, heads=16, d_k=32, d_v=32, d_ff=128):
+    def __init__(self, heads=16, d_k=32, d_v=32, d_ff=128, d_out=None):
         super(MHDPA, self).__init__()
         self.heads = heads
         self.d_k = d_k
         self.d_v = d_v
         self.d_ff = d_ff
+        self.d_out = d_out
         self.final = self.kernel1 = None
 
-    def apply(self, x_from, x_to, final_value=True, residual=True, expand_from=1, softmax_dim=0):
-        s = x_to.shape.as_list()
-        d_model = s[-1]
-        expand_to = len(x_from.shape.as_list()) + expand_from - len(s)
-
+    def apply_to(self, x_to):
         if not self.weights:
+            self.d_model = x_to.shape[-1]
             # Sublayer 1
-            self.query = self.add_variable('query', [d_model, self.heads, self.d_k])
-            self.key = self.add_variable('key',     [d_model, self.heads, self.d_k])
-            self.value = self.add_variable('value', [d_model, self.heads, self.d_v])
+            self.query = self.add_variable('query', [self.d_model, self.heads, self.d_k])
+            self.key = self.add_variable('key',     [self.d_model, self.heads, self.d_k])
+            self.value = self.add_variable('value', [self.d_model, self.heads, self.d_v])
 
         # Project each entity into q,k,v vectors
-        query = tf.tensordot(x_from, self.query, [-1, 0])
-        key   = tf.tensordot(x_to, self.key,     [-1, 0])
         value = tf.tensordot(x_to, self.value,   [-1, 0])
+        key   = tf.tensordot(x_to, self.key,     [-1, 0])
+        key = layer_norm(key)
+        return key, value
 
-        if 1:
-            def layer_norm(n): return tf.contrib.layers.layer_norm(n, False, False, begin_norm_axis=-1)
-            query = layer_norm(query)
-            key = layer_norm(key)
-            #value = layer_norm(value)
+    def apply_from(self, x_from, key, value, final_value=True, residual=True, expand_from=1, softmax_dim=0):
+        # Project each entity into q,k,v vectors
+        query = tf.tensordot(x_from, self.query, [-1, 0])
+        query = layer_norm(query)
 
+        expand_to = len(x_from.shape) + expand_from - (len(key.shape)-1)
         # Compare each q with every other entity k via dot-product
         for d in range(expand_from):
             query = tf.expand_dims(query, softmax_dim)
@@ -76,7 +78,6 @@ class MHDPA(base.Layer):
         if expand_from==2:
             dot_product = tf.reshape(dot_product, [s[0], s[1]*s[2], s[1],s[2], self.heads])
         attention = tf.nn.softmax(dot_product, softmax_dim)
-        #attention = tf.nn.sigmoid(dot_product)
         if expand_from==2:
             attention = tf.reshape(attention, [s[0], s[1],s[2], s[1],s[2], self.heads])
 
@@ -93,7 +94,7 @@ class MHDPA(base.Layer):
             ret = tf.reshape(A, [-1, np.prod(A.shape[1:])])
         else:
             if not self.final:
-                self.final = self.add_variable('final', [self.heads, self.d_v, d_model])
+                self.final = self.add_variable('final', [self.heads, self.d_v, self.d_model])
 
             # Concatenate and once again project, resulting in the final values
             ret = tf.tensordot(A, self.final, [[-2,-1], [0,1]])
@@ -105,13 +106,16 @@ class MHDPA(base.Layer):
         if not self.kernel1:
             # Sublayer 2
             self.kernel1 = self.add_variable('kernel1', [ret.shape[-1], self.d_ff])
-            self.kernel2 = self.add_variable('kernel2', [self.d_ff*2, d_model])
+            self.kernel2 = self.add_variable('kernel2', [self.d_ff*2, self.d_out or self.d_model])
 
         # 2-layer MLP
         mlp = double_relu(tf.tensordot(ret, self.kernel1, [[-1], [0]]))
         ret = tf.tensordot(mlp, self.kernel2, [[-1], [0]])
 
-        if residual:
-            #ret += mlp
+        if residual and ret.shape[-1] == x_from.shape[-1]: # Residual only applies to default output size
             ret += x_from
         return ret, attention
+
+    def apply(self, x_from, x_to, **kwds):
+        key, value = self.apply_to(x_to)
+        return self.apply_from(x_from, key, value, **kwds)
