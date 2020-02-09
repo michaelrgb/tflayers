@@ -1,12 +1,11 @@
-import tensorflow as tf
-from tensorflow.python.layers import base
+from tfutils import *
 
 class LSTMCellBN(base.Layer):
     def __init__(self, outputs, batch_norm=None):
         super(LSTMCellBN, self).__init__()
         self.outputs = outputs
         self._linear1 = self.batch_norm = None
-    def apply(self, inputs, context):
+    def __call__(self, inputs, context):
         if not self._linear1:
             self._linear1 = tf.layers.Dense(4*self.outputs, use_bias=True)
         if not context:

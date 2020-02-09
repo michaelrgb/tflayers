@@ -1,5 +1,3 @@
-import tensorflow as tf, numpy as np
-from tensorflow.python.layers import base
 from tfutils import *
 
 # Concat x,y coordinate onto each entity feature vector
@@ -30,7 +28,7 @@ def top_k_conv(x, top_k):
     return x, top_k_idx
 
 def layer_norm(n):
-    return tf.contrib.layers.layer_norm(n, False, False, begin_norm_axis=-1)
+    return tf.keras.layers.LayerNormalization(center=False, scale=False)(n)
 
 # https://arxiv.org/abs/1706.03762
 class MHDPA(base.Layer):
@@ -42,15 +40,16 @@ class MHDPA(base.Layer):
         self.d_v = d_v
         self.d_ff = d_ff
         self.d_out = d_out
-        self.final = self.kernel1 = None
+        self.final = self.kernel1 = self.d_model = None
 
     def apply_to(self, x_to):
         if not self.weights:
-            self.d_model = x_to.shape[-1]
+            if not self.d_model:
+                self.d_model = x_to.shape[-1]
             # Sublayer 1
-            self.query = self.add_variable('query', [self.d_model, self.heads, self.d_k])
-            self.key = self.add_variable('key',     [self.d_model, self.heads, self.d_k])
-            self.value = self.add_variable('value', [self.d_model, self.heads, self.d_v])
+            self.query = self.add_weight('query', [self.d_model, self.heads, self.d_k])
+            self.key = self.add_weight('key',     [self.d_model, self.heads, self.d_k])
+            self.value = self.add_weight('value', [self.d_model, self.heads, self.d_v])
 
         # Project each entity into q,k,v vectors
         value = tf.tensordot(x_to, self.value,   [-1, 0])
@@ -58,7 +57,7 @@ class MHDPA(base.Layer):
         key = layer_norm(key)
         return key, value
 
-    def apply_from(self, x_from, key, value, final_value=True, residual=True, expand_from=1, softmax_dim=0):
+    def apply_from(self, x_from, key, value, residual=True, expand_from=1, softmax_dim=1):
         # Project each entity into q,k,v vectors
         query = tf.tensordot(x_from, self.query, [-1, 0])
         query = layer_norm(query)
@@ -86,36 +85,25 @@ class MHDPA(base.Layer):
         for d in range(expand_from):
             A = tf.reduce_sum(A, softmax_dim)
 
-        if not final_value:
-            return A, attention
+        if not self.d_ff:
+            return A, attention, dot_product
 
-        if self.d_ff:
-            # Is the final weight matrix needed before the MLP ?
-            ret = tf.reshape(A, [-1, np.prod(A.shape[1:])])
-        else:
-            if not self.final:
-                self.final = self.add_variable('final', [self.heads, self.d_v, self.d_model])
-
-            # Concatenate and once again project, resulting in the final values
-            ret = tf.tensordot(A, self.final, [[-2,-1], [0,1]])
-
-            if residual: ret += x_from
-            if not self.d_ff:
-                return ret, attention # No FF layer 2
-
+        ret = tf.reshape(A, [tf.shape(A)[0], -1])
         if not self.kernel1:
             # Sublayer 2
-            self.kernel1 = self.add_variable('kernel1', [ret.shape[-1], self.d_ff])
-            self.kernel2 = self.add_variable('kernel2', [self.d_ff*2, self.d_out or self.d_model])
+            self.kernel1 = self.add_weight('kernel1', [self.heads*self.d_v, self.d_ff])
+            self.kernel2 = self.add_weight('kernel2', [self.d_ff*2, self.d_out or self.d_model])
 
         # 2-layer MLP
-        mlp = double_relu(tf.tensordot(ret, self.kernel1, [[-1], [0]]))
-        ret = tf.tensordot(mlp, self.kernel2, [[-1], [0]])
+        mlp = double_relu(tf.matmul(ret, self.kernel1))
+        ret = tf.matmul(mlp, self.kernel2)
 
         if residual and ret.shape[-1] == x_from.shape[-1]: # Residual only applies to default output size
             ret += x_from
-        return ret, attention
+        return ret, attention, dot_product
 
-    def apply(self, x_from, x_to, **kwds):
+    def __call__(self, x_from, x_to, **kwds):
+        if not self.d_model:
+            self.d_model = x_from.shape[-1] # x_to from tf.image.extract_patches() dim is ?
         key, value = self.apply_to(x_to)
         return self.apply_from(x_from, key, value, **kwds)
